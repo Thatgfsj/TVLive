@@ -9,6 +9,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
@@ -172,28 +173,32 @@ class PlayerViewModel @Inject constructor(
 
     fun initializePlayer() {
         if (exoPlayer == null) {
-            // 针对电视硬件的负载控制 - 更大的缓冲区减少卡顿
+            // 针对HLS直播优化的负载控制
             val loadControl = DefaultLoadControl.Builder()
                 .setBufferDurationsMs(
-                    30000,    // minBufferMs: 最少缓冲30秒才开始播放，减少启动卡顿
-                    120000,   // maxBufferMs: 最大缓冲120秒，电视内存够用
-                    DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
-                    DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS
+                    5000,     // minBufferMs: 5s最小缓冲
+                    30000,    // maxBufferMs: 30s最大缓冲
+                    2500,     // bufferForPlaybackMs: 缓冲2.5s即可播放
+                    5000      // bufferForPlaybackAfterRebufferMs: 卡顿后缓冲5s恢复
                 )
+                .setPrioritizeTimeOverSizeThresholds(true)
                 .build()
 
-            exoPlayer = ExoPlayer.Builder(context)
+            // 异步MediaCodec队列，降低低配电视解码压力
+            val renderersFactory = DefaultRenderersFactory(context)
+                .forceEnableMediaCodecAsynchronousQueueing()
+
+            exoPlayer = ExoPlayer.Builder(context, renderersFactory)
                 .setLoadControl(loadControl)
-                .setUseLazyPreparation(false)  // 立即准备，不延迟
+                .setUseLazyPreparation(false)
                 .build()
                 .also {
                     it.addListener(playerListener)
                     it.playWhenReady = true
                     it.setHandleAudioBecomingNoisy(true)
-                    // 针对HLS直播低延迟优化
                     it.trackSelectionParameters = it.trackSelectionParameters
                         .buildUpon()
-                        .setMaxVideoSize(1920, 1080)  // 限制分辨率减少解码压力
+                        .setMaxVideoSize(1920, 1080)
                         .build()
                 }
         }
@@ -285,15 +290,27 @@ class PlayerViewModel @Inject constructor(
     private fun createMediaSource(source: StreamSource): MediaSource {
         val dataSourceFactory = DefaultHttpDataSource.Factory().apply {
             setUserAgent("Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36")
-            setConnectTimeoutMs(8000)   // 8秒连不上就快速失败
-            setReadTimeoutMs(15000)   // HLS只需读到m3u8即可，片段由ExoPlayer自行拉取
+            setConnectTimeoutMs(8000)
+            setReadTimeoutMs(15000)
+            setAllowCrossProtocolRedirects(true)
             if (source.referer != null) {
                 setDefaultRequestProperties(mapOf("Referer" to source.referer))
             }
         }
 
         val uri = Uri.parse(source.url)
-        val mediaItem = MediaItem.fromUri(uri)
+        val mediaItem = MediaItem.Builder()
+            .setUri(uri)
+            .setLiveConfiguration(
+                MediaItem.LiveConfiguration.Builder()
+                    .setTargetOffsetMs(3000)
+                    .setMinOffsetMs(1000)
+                    .setMaxOffsetMs(8000)
+                    .setMinPlaybackSpeed(0.97f)
+                    .setMaxPlaybackSpeed(1.03f)
+                    .build()
+            )
+            .build()
 
         return if (source.url.contains(".m3u8")) {
             HlsMediaSource.Factory(dataSourceFactory)
