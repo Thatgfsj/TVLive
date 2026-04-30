@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="phone"
+        android:enabled="true"
+        android:icon="@drawable/ic_launcher_legacy"
+        android:label="手机电视"
+        android:targetPackage="com.tvlive"
+        android:targetClass="com.tvlive.PhoneMainActivity">
+        <intent
+            android:action="android.intent.action.MAIN"
+            android:targetPackage="com.tvlive"
+            android:targetClass="com.tvlive.PhoneMainActivity" />
+        <categories android:name="android.intent.category.LAUNCHER" />
+    </shortcut>
+</shortcuts>
