@@ -7,13 +7,9 @@ import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
-import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.MediaSource
-import androidx.media3.exoplayer.source.ProgressiveMediaSource
-import androidx.media3.exoplayer.hls.HlsMediaSource
 import com.tvlive.data.model.Channel
 import com.tvlive.data.model.ChannelCategory
 import com.tvlive.data.model.DecoderType
@@ -232,10 +228,10 @@ class PlayerViewModel @Inject constructor(
 
     private fun playSource(source: StreamSource, channel: Channel) {
         exoPlayer?.let { player ->
-            // 直接 setMediaSource + prepare，不调 stop()
-            // stop() 异步释放解码器，会导致新旧解码器同时存在 → 双重音频
-            val mediaSource = createMediaSource(source)
-            player.setMediaSource(mediaSource)
+            // setMediaItem() 是 ExoPlayer 高层 API，内部正确处理解码器过渡，
+            // 不需要手动 stop()。setMediaSource() 是底层 API，跨流切换时不会
+            // 清理旧解码器，导致双重音频。
+            player.setMediaItem(buildMediaItem(source))
             player.prepare()
             player.playWhenReady = true
             startPlaybackWatchdog(channel, source)
@@ -243,29 +239,25 @@ class PlayerViewModel @Inject constructor(
     }
 
     // 智能保活 - 只在播放真正卡死时才干预
-    // HLS直播流STATE_ENDED是正常的（播放列表结束会自动请求更新），不轻易干预
     private fun startPlaybackWatchdog(@Suppress("UNUSED_PARAMETER") channel: Channel, @Suppress("UNUSED_PARAMETER") source: StreamSource) {
         playbackCheckJob?.cancel()
         playbackCheckJob = viewModelScope.launch {
             var consecutiveEndedCount = 0
             while (true) {
-                delay(15000) // 15秒检查一次，给ExoPlayer足够时间自行恢复
+                delay(15000)
 
                 exoPlayer?.let { player ->
                     val state = player.playbackState
                     when (state) {
                         Player.STATE_IDLE -> {
-                            // 播放器空闲（异常），尝试恢复
                             if (!isSourceSwitching && player.playbackState == Player.STATE_IDLE) {
                                 player.prepare()
                                 player.playWhenReady = true
                             }
                         }
                         Player.STATE_ENDED -> {
-                            // 直播流连续多次ENDED才判定为真正卡死
                             consecutiveEndedCount++
                             if (consecutiveEndedCount >= 4) {
-                                // 60秒内连续4次ENDED，切换源
                                 if (!isSourceSwitching) {
                                     handlePlaybackError()
                                 }
@@ -273,7 +265,6 @@ class PlayerViewModel @Inject constructor(
                             }
                         }
                         Player.STATE_READY, Player.STATE_BUFFERING -> {
-                            // 正常播放或缓冲中，重置计数
                             consecutiveEndedCount = 0
                         }
                     }
@@ -282,20 +273,9 @@ class PlayerViewModel @Inject constructor(
         }
     }
 
-    private fun createMediaSource(source: StreamSource): MediaSource {
-        val dataSourceFactory = DefaultHttpDataSource.Factory().apply {
-            setUserAgent("Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36")
-            setConnectTimeoutMs(8000)
-            setReadTimeoutMs(15000)
-            setAllowCrossProtocolRedirects(true)
-            if (source.referer != null) {
-                setDefaultRequestProperties(mapOf("Referer" to source.referer))
-            }
-        }
-
-        val uri = Uri.parse(source.url)
-        val mediaItem = MediaItem.Builder()
-            .setUri(uri)
+    private fun buildMediaItem(source: StreamSource): MediaItem {
+        return MediaItem.Builder()
+            .setUri(Uri.parse(source.url))
             .setLiveConfiguration(
                 MediaItem.LiveConfiguration.Builder()
                     .setTargetOffsetMs(3000)
@@ -306,15 +286,6 @@ class PlayerViewModel @Inject constructor(
                     .build()
             )
             .build()
-
-        return if (source.url.contains(".m3u8")) {
-            HlsMediaSource.Factory(dataSourceFactory)
-                .setAllowChunklessPreparation(true)  // 允许无chunk准备，加速启动
-                .createMediaSource(mediaItem)
-        } else {
-            ProgressiveMediaSource.Factory(dataSourceFactory)
-                .createMediaSource(mediaItem)
-        }
     }
 
     fun getPlayer(): ExoPlayer? = exoPlayer
