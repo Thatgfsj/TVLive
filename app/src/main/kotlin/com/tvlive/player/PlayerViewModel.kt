@@ -176,10 +176,10 @@ class PlayerViewModel @Inject constructor(
             // 针对HLS直播优化的负载控制
             val loadControl = DefaultLoadControl.Builder()
                 .setBufferDurationsMs(
-                    5000,     // minBufferMs: 5s最小缓冲
-                    30000,    // maxBufferMs: 30s最大缓冲
-                    2500,     // bufferForPlaybackMs: 缓冲2.5s即可播放
-                    5000      // bufferForPlaybackAfterRebufferMs: 卡顿后缓冲5s恢复
+                    15000,    // minBufferMs: 15s，HLS 10s片段需完整缓冲
+                    60000,    // maxBufferMs: 60s
+                    5000,     // bufferForPlaybackMs: 缓冲5s后再播放，保证有画面
+                    10000     // bufferForPlaybackAfterRebufferMs
                 )
                 .setPrioritizeTimeOverSizeThresholds(true)
                 .build()
@@ -236,20 +236,19 @@ class PlayerViewModel @Inject constructor(
 
     private fun playSource(source: StreamSource, channel: Channel) {
         exoPlayer?.let { player ->
-            // 先停止当前播放，避免双重音频解码器
-            player.stop()
+            // 直接 setMediaSource + prepare，不调 stop()
+            // stop() 异步释放解码器，会导致新旧解码器同时存在 → 双重音频
             val mediaSource = createMediaSource(source)
             player.setMediaSource(mediaSource)
             player.prepare()
             player.playWhenReady = true
-            // 开始保活检查
             startPlaybackWatchdog(channel, source)
         }
     }
 
     // 智能保活 - 只在播放真正卡死时才干预
     // HLS直播流STATE_ENDED是正常的（播放列表结束会自动请求更新），不轻易干预
-    private fun startPlaybackWatchdog(channel: Channel, source: StreamSource) {
+    private fun startPlaybackWatchdog(@Suppress("UNUSED_PARAMETER") channel: Channel, @Suppress("UNUSED_PARAMETER") source: StreamSource) {
         playbackCheckJob?.cancel()
         playbackCheckJob = viewModelScope.launch {
             var consecutiveEndedCount = 0
@@ -471,7 +470,7 @@ class PlayerViewModel @Inject constructor(
             var bestCctv8Speed: Long = Long.MAX_VALUE
             val testItems = mutableListOf<SpeedTestItem>()
 
-            for ((index, pair) in cctv8Sources.withIndex()) {
+            for ((_, pair) in cctv8Sources.withIndex()) {
                 val (channel, source) = pair
                 val speedMs = measureSourceSpeedFast(source.url)
 
