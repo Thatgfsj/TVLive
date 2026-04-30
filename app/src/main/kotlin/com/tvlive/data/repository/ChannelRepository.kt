@@ -29,14 +29,9 @@ class ChannelRepository @Inject constructor(
     // 内置频道列表 — 请在此处添加你的直播源
     // ============================================================
     //
-    // 直播源格式: StreamSource("m3u8地址", "标签")
-    //
+    // 直播源格式: StreamSource("URL", "标签")
     // 支持的格式: .m3u8 (HLS直播流), .mp4
-    //
-    // 如何获取直播源:
-    //   1. GitHub 搜索 "iptv sources" 或 "直播源"
-    //   2. 将找到的 m3u8 链接填入下方对应频道
-    //   3. 每个频道可配置多个源，播放失败时自动切换
+    // 每个频道可配置多个源，播放失败时自动切换
     //
     // 示例:
     //   StreamSource("http://example.com/live/cctv1.m3u8", "主源"),

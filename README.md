@@ -37,20 +37,11 @@ Channel(id = "cctv8", name = "CCTV-8 电视剧", category = ChannelCategory.CCTV
 
 ### 方法二：配置远程源自动更新
 
-在 `PlayerViewModel.kt` 的 `fetchRemoteSources()` 方法中填入你的 IPTV 源地址（支持 txt/m3u 格式）。
+在 `PlayerViewModel.kt` 的 `fetchRemoteSources()` 方法中填入你的远程源地址，支持以下格式：
 
-格式示例：
 ```
-央视频道,#genre#
-CCTV-1,http://example.com/cctv1.m3u8
-CCTV-2,http://example.com/cctv2.m3u8
-卫视频道,#genre#
-湖南卫视,http://example.com/hunan.m3u8
+频道名,URL
 ```
-
-### 直播源去哪找？
-
-GitHub 搜索 `iptv` 或 `直播源`，有很多社区维护的项目。
 
 ## 编译
 
