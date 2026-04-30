@@ -69,9 +69,11 @@ class PlayerViewModel @Inject constructor(
     val playerState: StateFlow<PlayerState> = _playerState.asStateFlow()
 
     private var exoPlayer: ExoPlayer? = null
-    private val maxAutoRetries = 10
+    private val maxAutoRetries = 3
     private var isSourceSwitching = false
     private var playbackCheckJob: kotlinx.coroutines.Job? = null
+    // 本次会话中已失败的源，不再重试
+    private val sessionFailedSources = mutableSetOf<String>()
 
     private val playerListener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
@@ -115,10 +117,36 @@ class PlayerViewModel @Inject constructor(
         val currentState = _playerState.value
         val currentChannel = currentState.currentChannel ?: return
 
-        // 多源自动切换
+        // 记录当前失败源
+        val failedUrl = currentChannel.currentSource?.url
+        if (failedUrl != null) {
+            sessionFailedSources.add(failedUrl)
+        }
+
+        // 找到下一个未失败过的源
         if (currentChannel.sources.size > 1 && currentState.retryCount < maxAutoRetries) {
+            var nextIndex = (currentState.currentSourceIndex + 1) % currentChannel.sources.size
+            var attempts = 0
+            while (attempts < currentChannel.sources.size) {
+                val candidate = currentChannel.sources[nextIndex]
+                if (candidate.url !in sessionFailedSources) {
+                    break
+                }
+                nextIndex = (nextIndex + 1) % currentChannel.sources.size
+                attempts++
+            }
+
+            // 所有源都失败过
+            if (attempts >= currentChannel.sources.size) {
+                _playerState.value = currentState.copy(
+                    isLoading = false,
+                    error = "所有源均失败，请尝试其他频道"
+                )
+                isSourceSwitching = false
+                return
+            }
+
             isSourceSwitching = true
-            val nextIndex = (currentState.currentSourceIndex + 1) % currentChannel.sources.size
             val nextSource = currentChannel.sources[nextIndex]
 
             _playerState.value = currentState.copy(
@@ -128,7 +156,6 @@ class PlayerViewModel @Inject constructor(
                 switchReason = "源${nextIndex + 1}: ${nextSource.quality}"
             )
 
-            // 如果切换超过一次成功，保存这个源索引
             if (nextIndex > 0) {
                 channelRepository.saveBestSourceIndex(currentChannel.id, nextIndex)
             }
@@ -183,6 +210,7 @@ class PlayerViewModel @Inject constructor(
 
     fun playChannel(channel: Channel) {
         isSourceSwitching = false
+        sessionFailedSources.clear()  // 换频道时清空失败记录
         // 使用缓存的最佳源索引
         val bestIdx = channelRepository.getBestSourceIndex(channel.id)
         val sourceIndex = if (bestIdx in channel.sources.indices) bestIdx else 0
@@ -203,6 +231,8 @@ class PlayerViewModel @Inject constructor(
 
     private fun playSource(source: StreamSource, channel: Channel) {
         exoPlayer?.let { player ->
+            // 先停止当前播放，避免双重音频解码器
+            player.stop()
             val mediaSource = createMediaSource(source)
             player.setMediaSource(mediaSource)
             player.prepare()
@@ -212,43 +242,39 @@ class PlayerViewModel @Inject constructor(
         }
     }
 
-    // 智能保活 - 只在播放真正卡死时才重新加载
-    // 不再每15秒重启播放，避免因网络波动导致的反复重连
+    // 智能保活 - 只在播放真正卡死时才干预
+    // HLS直播流STATE_ENDED是正常的（播放列表结束会自动请求更新），不轻易干预
     private fun startPlaybackWatchdog(channel: Channel, source: StreamSource) {
         playbackCheckJob?.cancel()
         playbackCheckJob = viewModelScope.launch {
-            var stallCount = 0
+            var consecutiveEndedCount = 0
             while (true) {
-                delay(10000) // 10秒检查一次
+                delay(15000) // 15秒检查一次，给ExoPlayer足够时间自行恢复
 
                 exoPlayer?.let { player ->
                     val state = player.playbackState
-                    // 只在IDLE或ENDED状态（真正停止）时才重新播放
-                    // STATE_BUFFERING是正常的网络缓冲，不干预
                     when (state) {
                         Player.STATE_IDLE -> {
-                            // 空闲状态 - 尝试恢复
-                            if (!isSourceSwitching) {
+                            // 播放器空闲（异常），尝试恢复
+                            if (!isSourceSwitching && player.playbackState == Player.STATE_IDLE) {
                                 player.prepare()
                                 player.playWhenReady = true
                             }
                         }
                         Player.STATE_ENDED -> {
-                            // 直播流结束才重新加载
-                            if (!isSourceSwitching) {
-                                stallCount++
-                                if (stallCount >= 2) {
-                                    // 连续两次ENDED才切换源
+                            // 直播流连续多次ENDED才判定为真正卡死
+                            consecutiveEndedCount++
+                            if (consecutiveEndedCount >= 4) {
+                                // 60秒内连续4次ENDED，切换源
+                                if (!isSourceSwitching) {
                                     handlePlaybackError()
-                                    return@launch
                                 }
-                                playSource(source, channel)
                                 return@launch
                             }
                         }
-                        Player.STATE_READY -> {
-                            // 恢复正常，重置计数
-                            stallCount = 0
+                        Player.STATE_READY, Player.STATE_BUFFERING -> {
+                            // 正常播放或缓冲中，重置计数
+                            consecutiveEndedCount = 0
                         }
                     }
                 }
@@ -259,8 +285,8 @@ class PlayerViewModel @Inject constructor(
     private fun createMediaSource(source: StreamSource): MediaSource {
         val dataSourceFactory = DefaultHttpDataSource.Factory().apply {
             setUserAgent("Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36")
-            setConnectTimeoutMs(20000)
-            setReadTimeoutMs(60000)  // 增加读超时，HLS分段下载需要更长时间
+            setConnectTimeoutMs(8000)   // 8秒连不上就快速失败
+            setReadTimeoutMs(15000)   // HLS只需读到m3u8即可，片段由ExoPlayer自行拉取
             if (source.referer != null) {
                 setDefaultRequestProperties(mapOf("Referer" to source.referer))
             }
@@ -401,10 +427,14 @@ class PlayerViewModel @Inject constructor(
                 isBackgroundTesting = false
             )
 
-            // 先获取远程源
-            val remoteResult = fetchRemoteSources()
-            if (remoteResult.isSuccess) {
-                channelRepository.updateRemoteSources(remoteResult.getOrNull()!!)
+            // 后台拉取最新远程源（非阻塞）
+            async(Dispatchers.IO) {
+                if (shouldUpdateSources()) {
+                    val remoteResult = fetchRemoteSources()
+                    if (remoteResult.isSuccess) {
+                        channelRepository.updateRemoteSources(remoteResult.getOrNull()!!)
+                    }
+                }
             }
 
             val channels = channelRepository.getChannels()
@@ -428,7 +458,7 @@ class PlayerViewModel @Inject constructor(
                 val (channel, source) = pair
                 val speedMs = measureSourceSpeedFast(source.url)
 
-                val status = if (speedMs != null && speedMs <= 200) {
+                val status = if (speedMs != null && speedMs <= 3000) {
                     if (speedMs < bestCctv8Speed) {
                         bestCctv8Speed = speedMs
                         bestCctv8 = pair
@@ -483,7 +513,7 @@ class PlayerViewModel @Inject constructor(
                             var bestSpeed = Long.MAX_VALUE
                             for ((idx, source) in channel.sources.withIndex()) {
                                 val speedMs = measureSourceSpeedFast(source.url)
-                                if (speedMs != null && speedMs < bestSpeed && speedMs <= 300) {
+                                if (speedMs != null && speedMs < bestSpeed && speedMs <= 3000) {
                                     bestSpeed = speedMs
                                     bestIdx = idx
                                 }
@@ -511,26 +541,54 @@ class PlayerViewModel @Inject constructor(
         }
     }
 
-    // 快速测速 - 200ms超时
+    // 快速测速 - 实际下载m3u8内容并验证TS片段可达
     private suspend fun measureSourceSpeedFast(url: String): Long? = withContext(Dispatchers.IO) {
         try {
             val startTime = System.currentTimeMillis()
             val urlObj = URL(url)
             val conn = urlObj.openConnection() as HttpURLConnection
-            conn.connectTimeout = 200
-            conn.readTimeout = 200
-            conn.requestMethod = "HEAD"
+            conn.connectTimeout = 3000
+            conn.readTimeout = 5000
+            conn.requestMethod = "GET"
             conn.instanceFollowRedirects = true
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0")
 
             val responseCode = conn.responseCode
-            val endTime = System.currentTimeMillis()
+            if (responseCode != HttpURLConnection.HTTP_OK) {
+                conn.disconnect()
+                return@withContext null
+            }
 
+            // 读取m3u8内容，获取第一个TS片段地址
+            val reader = BufferedReader(InputStreamReader(conn.inputStream))
+            var tsPath: String? = null
+            var lineCount = 0
+            while (lineCount < 50) {
+                val line = reader.readLine() ?: break
+                if (!line.startsWith("#") && (line.contains(".ts") || line.contains(".m3u8"))) {
+                    tsPath = line.trim()
+                    break
+                }
+                lineCount++
+            }
+            reader.close()
             conn.disconnect()
 
-            if (responseCode == HttpURLConnection.HTTP_OK ||
-                responseCode == HttpURLConnection.HTTP_MOVED_TEMP ||
-                responseCode == 301 || responseCode == 302) {
-                return@withContext endTime - startTime
+            // 验证第一个TS片段可达
+            if (tsPath != null) {
+                val baseUrl = url.substringBeforeLast("/")
+                val tsUrl = if (tsPath.startsWith("http")) tsPath else "$baseUrl/$tsPath"
+                val tsConn = URL(tsUrl).openConnection() as HttpURLConnection
+                tsConn.connectTimeout = 3000
+                tsConn.readTimeout = 3000
+                tsConn.requestMethod = "HEAD"
+                tsConn.instanceFollowRedirects = true
+                val tsCode = tsConn.responseCode
+                tsConn.disconnect()
+
+                if (tsCode == HttpURLConnection.HTTP_OK || tsCode == 206) {
+                    return@withContext System.currentTimeMillis() - startTime
+                }
             }
             null
         } catch (e: Exception) {
