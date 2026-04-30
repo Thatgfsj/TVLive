@@ -93,15 +93,11 @@ class PlayerViewModel @Inject constructor(
                     )
                     isSourceSwitching = false
                 }
-                Player.STATE_ENDED -> {
-                    // 直播流结束通常是卡顿，尝试重新播放
-                    viewModelScope.launch {
-                        handlePlaybackError()
-                    }
-                }
                 Player.STATE_IDLE -> {
                     _playerState.value = _playerState.value.copy(isPlaying = false)
                 }
+                // STATE_ENDED 不在此处理 — HLS直播流 playlist 结束时 ExoPlayer 会
+                // 自动请求新 playlist，不应干预。由 watchdog 检测持续卡死。
             }
         }
 
