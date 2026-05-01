@@ -69,6 +69,9 @@ class PlayerViewModel @Inject constructor(
     private val maxAutoRetries = 3
     private var isSourceSwitching = false
     private var playbackCheckJob: kotlinx.coroutines.Job? = null
+    private var speedTestJob: kotlinx.coroutines.Job? = null
+    private var errorHandlingJob: kotlinx.coroutines.Job? = null
+    private var lastChannelSwitchTime = 0L
     // 本次会话中已失败的源，不再重试
     private val sessionFailedSources = mutableSetOf<String>()
 
@@ -98,7 +101,8 @@ class PlayerViewModel @Inject constructor(
         }
 
         override fun onPlayerError(error: PlaybackException) {
-            viewModelScope.launch {
+            errorHandlingJob?.cancel()
+            errorHandlingJob = viewModelScope.launch {
                 handlePlaybackError()
             }
         }
@@ -199,6 +203,10 @@ class PlayerViewModel @Inject constructor(
     fun releasePlayer() {
         playbackCheckJob?.cancel()
         playbackCheckJob = null
+        speedTestJob?.cancel()
+        speedTestJob = null
+        errorHandlingJob?.cancel()
+        errorHandlingJob = null
         exoPlayer?.removeListener(playerListener)
         exoPlayer?.release()
         exoPlayer = null
@@ -206,6 +214,11 @@ class PlayerViewModel @Inject constructor(
     }
 
     fun playChannel(channel: Channel) {
+        // 防抖：500ms内重复调用直接忽略
+        val now = System.currentTimeMillis()
+        if (now - lastChannelSwitchTime < 500) return
+        lastChannelSwitchTime = now
+
         isSourceSwitching = false
         sessionFailedSources.clear()  // 换频道时清空失败记录
         // 使用缓存的最佳源索引
@@ -250,9 +263,8 @@ class PlayerViewModel @Inject constructor(
                     val state = player.playbackState
                     when (state) {
                         Player.STATE_IDLE -> {
-                            if (!isSourceSwitching && player.playbackState == Player.STATE_IDLE) {
-                                player.prepare()
-                                player.playWhenReady = true
+                            if (!isSourceSwitching) {
+                                handlePlaybackError()
                             }
                         }
                         Player.STATE_ENDED -> {
@@ -399,7 +411,8 @@ class PlayerViewModel @Inject constructor(
 
     // 测速所有源 - 先测CCTV-8播放，后台继续测CCTV-1和CCTV-6
     fun speedTestAllSources(onComplete: (SpeedTestResult) -> Unit) {
-        viewModelScope.launch {
+        speedTestJob?.cancel()
+        speedTestJob = viewModelScope.launch {
             _playerState.value = _playerState.value.copy(
                 isSpeedTesting = true,
                 speedTestProgress = 0f,
@@ -475,12 +488,9 @@ class PlayerViewModel @Inject constructor(
                 val channel = bestCctv8.first
                 val sourceIdx = channel.sources.indexOf(bestCctv8.second)
                 channelRepository.saveBestSourceIndex(channel.id, sourceIdx)
-                _playerState.value = _playerState.value.copy(
-                    isSpeedTesting = false,
-                    currentChannel = channel.copy(currentSourceIndex = sourceIdx),
-                    currentSourceIndex = sourceIdx
-                )
-                playSource(bestCctv8.second, channel.copy(currentSourceIndex = sourceIdx))
+                _playerState.value = _playerState.value.copy(isSpeedTesting = false)
+                // 通过playChannel()播放，走完整的状态管理流程
+                playChannel(channel)
             } else {
                 _playerState.value = _playerState.value.copy(isSpeedTesting = false)
             }
@@ -613,6 +623,8 @@ class PlayerViewModel @Inject constructor(
     }
 
     fun cancelSpeedTest() {
+        speedTestJob?.cancel()
+        speedTestJob = null
         _playerState.value = _playerState.value.copy(
             isSpeedTesting = false,
             speedTestLogs = _playerState.value.speedTestLogs + "测速已取消"
