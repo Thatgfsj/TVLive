@@ -20,7 +20,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
 
 data class SpeedTestItem(
     val channelName: String,
@@ -35,29 +34,18 @@ enum class TestStatus {
     PENDING, TESTING, SUCCESS, FAILED, SKIPPED
 }
 
-// 兼容旧代码
-data class SpeedTestResult(
-    val channelName: String,
-    val sourceUrl: String,
-    val quality: String,
-    val speedMs: Long,
-    val isSuccess: Boolean,
-    val message: String = ""
-)
-
 @Composable
 fun SpeedTestDialog(
-    title: String,
     items: List<SpeedTestItem>,
     progress: Float,
     currentTesting: String?,
     bestChannel: String?,
     bestSpeed: Long?,
-    onCancel: () -> Unit
+    onSkip: () -> Unit
 ) {
     Dialog(
         onDismissRequest = { },
-        properties = DialogProperties(
+        properties = androidx.compose.ui.window.DialogProperties(
             dismissOnBackPress = false,
             dismissOnClickOutside = false,
             usePlatformDefaultWidth = false
@@ -65,77 +53,41 @@ fun SpeedTestDialog(
     ) {
         Box(
             modifier = Modifier
-                .fillMaxSize()
-                .background(Color.Black)
-                .padding(24.dp)
+                .fillMaxWidth(0.85f)
+                .wrapContentHeight()
+                .background(Color(0xFF141414), RoundedCornerShape(16.dp))
+                .padding(20.dp)
         ) {
-            Column(
-                modifier = Modifier.fillMaxSize()
-            ) {
-                // 标题
+            Column {
+                // 标题 + 进度
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = title,
-                        style = MaterialTheme.typography.headlineMedium,
+                        text = "正在测速选源...",
+                        style = MaterialTheme.typography.titleLarge,
                         color = Color.White
                     )
                     Text(
                         text = "${(progress * 100).toInt()}%",
                         color = Color.Cyan,
-                        style = MaterialTheme.typography.headlineMedium
+                        style = MaterialTheme.typography.titleMedium
                     )
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
-                // 当前状态
-                if (currentTesting != null) {
-                    Text(
-                        text = "正在测试: $currentTesting",
-                        color = Color.Yellow,
-                        fontSize = 14.sp
-                    )
-                }
+                // 当前正在测试的源
+                Text(
+                    text = currentTesting?.let { "正在测试: $it" } ?: " ",
+                    color = Color.Yellow,
+                    fontSize = 14.sp
+                )
 
-                // 最佳源
-                if (bestChannel != null && bestSpeed != null) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color(0xFF1A3A1A), RoundedCornerShape(8.dp))
-                            .padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "✓",
-                            color = Color.Green,
-                            fontSize = 20.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "最佳: $bestChannel",
-                            color = Color.White,
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Spacer(modifier = Modifier.width(16.dp))
-                        Text(
-                            text = "${bestSpeed}ms",
-                            color = Color.Green,
-                            fontSize = 16.sp
-                        )
-                    }
-                }
+                Spacer(modifier = Modifier.height(10.dp))
 
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // 进度条
                 LinearProgressIndicator(
                     progress = progress,
                     modifier = Modifier
@@ -146,59 +98,47 @@ fun SpeedTestDialog(
                     trackColor = Color.DarkGray
                 )
 
-                Spacer(modifier = Modifier.height(20.dp))
+                Spacer(modifier = Modifier.height(14.dp))
 
-                // 测试结果网格 - 4x5布局
-                Box(
+                // 测试结果网格
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(4),
                     modifier = Modifier
-                        .weight(1f)
                         .fillMaxWidth()
-                        .background(Color(0xFF0A0A0A), RoundedCornerShape(12.dp))
-                        .padding(12.dp)
+                        .height(240.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    userScrollEnabled = false
                 ) {
-                    LazyVerticalGrid(
-                        columns = GridCells.Fixed(4),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        itemsIndexed(items) { index, item ->
-                            SpeedTestItemCard(item = item)
-                        }
+                    itemsIndexed(items) { _, item ->
+                        SpeedTestItemCard(item = item)
                     }
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(14.dp))
 
-                // 汇总信息
-                val successCount = items.count { it.status == TestStatus.SUCCESS }
-                val failedCount = items.count { it.status == TestStatus.FAILED }
+                // 汇总 + 跳过按钮
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
+                    val successCount = items.count { it.status == TestStatus.SUCCESS }
+                    val doneCount = items.count { it.status != TestStatus.PENDING }
                     Text(
-                        text = "成功: $successCount  |  失败: $failedCount  |  共: ${items.size}",
+                        text = "可用: $successCount  |  已测: $doneCount/${items.size}  |  超时: 3秒",
                         color = Color.White.copy(alpha = 0.7f),
-                        fontSize = 14.sp
+                        fontSize = 13.sp
                     )
-                    Text(
-                        text = "超时: 200ms",
-                        color = Color.Gray,
-                        fontSize = 12.sp
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // 关闭按钮
-                Button(
-                    onClick = onCancel,
-                    modifier = Modifier.align(Alignment.End),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFFE53935)
-                    )
-                ) {
-                    Text("关闭")
+                    Button(
+                        onClick = onSkip,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFFE53935)
+                        ),
+                        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp)
+                    ) {
+                        Text("跳过测速")
+                    }
                 }
             }
         }
@@ -237,12 +177,11 @@ fun SpeedTestItemCard(item: SpeedTestItem) {
 
     Box(
         modifier = Modifier
-            .aspectRatio(1.3f)
-            .fillMaxWidth()
+            .aspectRatio(1.4f)
             .background(backgroundColor, RoundedCornerShape(8.dp))
             .border(
                 width = 2.dp,
-                color = if (item.status == TestStatus.TESTING) borderColor.copy(alpha = alpha) else borderColor,
+                color = borderColor,
                 shape = RoundedCornerShape(8.dp)
             )
             .padding(8.dp),
@@ -252,15 +191,9 @@ fun SpeedTestItemCard(item: SpeedTestItem) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            // 频道名称
             Text(
-                text = item.channelName,
-                color = when (item.status) {
-                    TestStatus.SUCCESS -> Color.Green
-                    TestStatus.FAILED -> Color.Red.copy(alpha = 0.6f)
-                    TestStatus.TESTING -> Color.Yellow
-                    else -> Color.White.copy(alpha = 0.6f)
-                },
+                text = item.quality,
+                color = Color.White.copy(alpha = 0.6f),
                 fontSize = 11.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
@@ -269,17 +202,15 @@ fun SpeedTestItemCard(item: SpeedTestItem) {
 
             Spacer(modifier = Modifier.height(4.dp))
 
-            // 状态/速度
             when (item.status) {
                 TestStatus.PENDING -> {
                     Text(
                         text = "等待",
                         color = Color.Gray,
-                        fontSize = 10.sp
+                        fontSize = 11.sp
                     )
                 }
                 TestStatus.TESTING -> {
-                    // 旋转指示器
                     CircularProgressIndicator(
                         modifier = Modifier.size(16.dp),
                         color = Color.Yellow,
@@ -298,7 +229,7 @@ fun SpeedTestItemCard(item: SpeedTestItem) {
                     Text(
                         text = item.message.ifEmpty { "失败" },
                         color = Color.Red.copy(alpha = 0.7f),
-                        fontSize = 9.sp,
+                        fontSize = 10.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
@@ -307,7 +238,7 @@ fun SpeedTestItemCard(item: SpeedTestItem) {
                     Text(
                         text = "跳过",
                         color = Color.Gray,
-                        fontSize = 10.sp
+                        fontSize = 11.sp
                     )
                 }
             }

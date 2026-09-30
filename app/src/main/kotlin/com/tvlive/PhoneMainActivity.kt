@@ -21,7 +21,9 @@ import com.tvlive.ui.theme.TVLiveTheme
 import dagger.hilt.android.AndroidEntryPoint
 
 @AndroidEntryPoint
-class PhoneMainActivity : ComponentActivity() {
+class PhoneMainActivity : ComponentActivity(), KeyDispatchOwner {
+
+    override val keyHub = KeyEventHub()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -51,12 +53,8 @@ class PhoneMainActivity : ComponentActivity() {
         }
     }
 
-    // 让系统处理所有按键
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        return false
-    }
-
     override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
+        if (event != null && keyHub.dispatch(event)) return true
         return super.dispatchKeyEvent(event)
     }
 }

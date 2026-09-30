@@ -49,10 +49,14 @@ fun PhoneMainScreen(
 
     val categories = remember { viewModel.getAllCategories() }
 
-    // 根据分类过滤频道
-    // 不再用playerState作为key，避免每次播放状态变化都重新计算频道列表
+    // 根据分类过滤频道（只显示有直播源的）
     val channels = remember(selectedCategory) {
         viewModel.getChannelsByCategory(selectedCategory)
+    }
+
+    // 数据变化时修正越界的选中索引
+    LaunchedEffect(channels) {
+        if (selectedChannelIndex >= channels.size) selectedChannelIndex = 0
     }
 
     // 初始化播放器 - 有缓存直接播，没缓存再测速
@@ -75,6 +79,7 @@ fun PhoneMainScreen(
         showChannelList = false
     }
 
+    // 手机按键处理：同样走 Activity 层 KeyEventHub，不依赖焦点
     DisposableEffect(view) {
         val onKeyEvent = { event: KeyEvent ->
             when (event.action) {
@@ -105,29 +110,24 @@ fun PhoneMainScreen(
             }
         }
 
-        val callback = object : android.view.View.OnKeyListener {
-            override fun onKey(v: android.view.View?, keyCode: Int, event: KeyEvent?): Boolean {
-                return if (event != null) onKeyEvent(event) else false
-            }
-        }
-
-        view.setOnKeyListener(callback)
+        val dispatchOwner = view.context as? com.tvlive.KeyDispatchOwner
+        dispatchOwner?.keyHub?.handler = onKeyEvent
         onDispose {
-            view.setOnKeyListener(null)
+            dispatchOwner?.keyHub?.handler = null
         }
     }
 
     // 显示可视化测速弹窗
     if (playerState.isSpeedTesting) {
         SpeedTestDialog(
-            title = "智能测速选源中...",
             items = playerState.speedTestItems,
             progress = playerState.speedTestProgress,
             currentTesting = playerState.currentTesting,
             bestChannel = playerState.bestChannel,
             bestSpeed = playerState.bestSpeed,
-            onCancel = {
-                viewModel.cancelSpeedTest()
+            onSkip = {
+                viewModel.skipSpeedTest()
+                showChannelList = false
             }
         )
     }
@@ -183,6 +183,34 @@ fun PhoneMainScreen(
             viewModel = viewModel,
             modifier = Modifier.fillMaxSize()
         )
+
+        // 错误提示（手机端此前不显示任何错误）
+        playerState.error?.let { error ->
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.8f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = error,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = Color.White
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Button(onClick = { viewModel.retry() }) {
+                        Text("重试")
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(onClick = { showChannelList = true }) {
+                        Text("选择频道")
+                    }
+                }
+            }
+        }
 
         // 控制按钮层
         AnimatedVisibility(

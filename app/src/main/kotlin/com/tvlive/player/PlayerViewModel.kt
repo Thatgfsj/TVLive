@@ -2,30 +2,42 @@ package com.tvlive.player
 
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import okhttp3.ConnectionPool
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
 import com.tvlive.data.model.Channel
 import com.tvlive.data.model.ChannelCategory
-import com.tvlive.data.model.DecoderType
 import com.tvlive.data.model.StreamSource
 import com.tvlive.data.repository.ChannelRepository
 import com.tvlive.ui.components.SpeedTestItem
-import com.tvlive.ui.components.SpeedTestResult
 import com.tvlive.ui.components.TestStatus
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.async
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
@@ -33,6 +45,7 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import javax.inject.Inject
+import kotlin.math.abs
 
 data class PlayerState(
     val isLoading: Boolean = false,
@@ -40,20 +53,14 @@ data class PlayerState(
     val error: String? = null,
     val currentChannel: Channel? = null,
     val currentSourceIndex: Int = 0,
-    val retryCount: Int = 0,
-    val decoderType: DecoderType = DecoderType.AUTO,
     val isAutoSwitching: Boolean = false,
     val switchReason: String? = null,
     val isSpeedTesting: Boolean = false,
     val speedTestProgress: Float = 0f,
-    val speedTestLogs: List<String> = emptyList(),
-    val speedTestResults: List<SpeedTestResult> = emptyList(),
-    // 新增：可视化测速
     val speedTestItems: List<SpeedTestItem> = emptyList(),
     val currentTesting: String? = null,
     val bestChannel: String? = null,
-    val bestSpeed: Long? = null,
-    val isBackgroundTesting: Boolean = false
+    val bestSpeed: Long? = null
 )
 
 @HiltViewModel
@@ -62,142 +69,341 @@ class PlayerViewModel @Inject constructor(
     private val channelRepository: ChannelRepository
 ) : ViewModel() {
 
+    companion object {
+        private const val TAG = "TVLivePlayer"
+        private const val SWITCH_DEBOUNCE_MS = 2000L
+        private const val CHANNEL_SWITCH_DEBOUNCE_MS = 500L
+        private const val WATCHDOG_INTERVAL_MS = 4000L
+        private const val SPEED_TEST_TIMEOUT_MS = 3000
+
+        /** 连续 N 次检测到画面无进展（约 8 秒）判定为卡死 */
+        private const val STALL_CHECKS = 2
+
+        /** 连续 N 次检测到缓冲中（约 8 秒）判定为源不可用 */
+        private const val BUFFERING_CHECKS_LIMIT = 2
+
+        /** 全部源失败后自动跳频道的最大连续次数（防止全站皆死时无限循环） */
+        private const val MAX_AUTO_ADVANCE = 5
+
+        /**
+         * 远程 IPTV 源地址（支持 m3u / txt 格式），每 3 天自动拉取一次，
+         * 新源并入内置频道（内置源优先）。留空则不启用远程更新。
+         * 为规避版权风险，本项目默认留空；请自行填入你信任的公共列表地址。
+         */
+        private const val REMOTE_SOURCE_URL = ""
+    }
+
     private val _playerState = MutableStateFlow(PlayerState())
     val playerState: StateFlow<PlayerState> = _playerState.asStateFlow()
 
     private var exoPlayer: ExoPlayer? = null
-    private val maxAutoRetries = 3
-    private var isSourceSwitching = false
-    private var playbackCheckJob: kotlinx.coroutines.Job? = null
-    private var speedTestJob: kotlinx.coroutines.Job? = null
-    private var errorHandlingJob: kotlinx.coroutines.Job? = null
+    private var playbackCheckJob: Job? = null
+    private var speedTestJob: Job? = null
+    private var errorHandlingJob: Job? = null
+    private var autoRetryJob: Job? = null
+    private var lastSwitchTime = 0L
     private var lastChannelSwitchTime = 0L
-    // 本次会话中已失败的源，不再重试
+
+    /** 距离上次成功播放（STATE_READY）以来自动跳频道的次数 */
+    private var autoAdvanceCount = 0
+
+    /** 当前源开始播放的时刻：用于判断失败前是否给过它足够的机会（8 秒） */
+    private var currentSourceStartedAt = 0L
+
+    /** 当前源这次尝试是否成功播出过：没播出过的死源不值得原位重载 */
+    private var currentSourceEverReady = false
+
+    /** 本频道本次进入后是否成功播出过 */
+    private var everReadyThisChannel = false
+
+    /** 最近一次成功播出（STATE_READY）的源索引：重新轮询时优先从它开始 */
+    private var lastReadySourceIndex = 0
+
+    /** 全部源失败后重新轮询的轮数 */
+    private var fullCycles = 0
+
+    /** 一个源至少要跑过这么久才允许被标记为"失败"（几秒内就挂的多半是网络抖动） */
+    private val MIN_TRIAL_MS = 8000L
+
+    /** 源健康度评分（本会话内）：成功 +2，确认失败 -3。换源时优先切高分源 */
+    private val sourceScores = mutableMapOf<String, Int>()
+
+    /** 本次会话中已确认失败的源 URL，自动换源时跳过；换频道时清空 */
     private val sessionFailedSources = mutableSetOf<String>()
 
     private val playerListener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
             when (playbackState) {
-                Player.STATE_BUFFERING -> {
-                    _playerState.value = _playerState.value.copy(isLoading = true, error = null)
-                }
+                Player.STATE_BUFFERING -> update { it.copy(isLoading = true, error = null) }
                 Player.STATE_READY -> {
-                    _playerState.value = _playerState.value.copy(
-                        isLoading = false,
-                        isPlaying = true,
-                        error = null,
-                        retryCount = 0,
-                        isAutoSwitching = false,
-                        switchReason = null
-                    )
-                    isSourceSwitching = false
+                    // 播放成功才把当前源记为最佳源，供下次启动秒开
+                    autoAdvanceCount = 0
+                    everReadyThisChannel = true
+                    currentSourceEverReady = true
+                    lastReadySourceIndex = _playerState.value.currentSourceIndex
+                    val st = _playerState.value
+                    st.currentChannel?.sources?.getOrNull(st.currentSourceIndex)?.url?.let { url ->
+                        sourceScores[url] = (sourceScores[url] ?: 0) + 2
+                    }
+                    st.currentChannel?.let { channel ->
+                        channelRepository.saveBestSourceIndex(channel.id, st.currentSourceIndex)
+                    }
+                    update {
+                        it.copy(
+                            isLoading = false,
+                            isPlaying = true,
+                            error = null,
+                            isAutoSwitching = false,
+                            switchReason = null
+                        )
+                    }
                 }
-                Player.STATE_IDLE -> {
-                    _playerState.value = _playerState.value.copy(isPlaying = false)
-                }
-                // STATE_ENDED 不在此处理 — HLS直播流 playlist 结束时 ExoPlayer 会
-                // 自动请求新 playlist，不应干预。由 watchdog 检测持续卡死。
+                Player.STATE_IDLE -> update { it.copy(isPlaying = false) }
+                // STATE_ENDED 不在此处理：HLS 直播 playlist 轮换时会短暂触发，
+                // 干预会造成换源风暴。由 watchdog 判断真卡死后先重试再换源。
             }
         }
 
         override fun onPlayerError(error: PlaybackException) {
+            Log.w(TAG, "播放出错: ${error.errorCodeName}")
             errorHandlingJob?.cancel()
             errorHandlingJob = viewModelScope.launch {
-                handlePlaybackError()
+                // 换源后 2 秒内报的错可能来自旧源，先正常处理；
+                // 若因防抖被跳过，稍后复查一次，避免新源快速失败时没人管
+                if (!handlePlaybackError("播放出错")) {
+                    delay(SWITCH_DEBOUNCE_MS)
+                    handlePlaybackError("播放出错复查")
+                }
             }
         }
     }
 
-    private suspend fun handlePlaybackError() {
-        if (isSourceSwitching) return
-
-        val currentState = _playerState.value
-        val currentChannel = currentState.currentChannel ?: return
-
-        // 记录当前失败源
-        val failedUrl = currentChannel.currentSource?.url
-        if (failedUrl != null) {
-            sessionFailedSources.add(failedUrl)
+    /**
+     * 播放失败时的自动恢复。返回 false 表示因防抖跳过（调用方需复查）。
+     *
+     * @param force 看门狗发起的强制恢复：绕过"正在播放/缓冲"保护。
+     *   该保护只适用于 onPlayerError（报错的可能已是被废弃的旧源）；
+     *   而看门狗正是因为 READY 但画面停住 / BUFFERING 超时才调用的，
+     *   如果也被这个保护挡掉，就会永远卡住不再换源。
+     */
+    private suspend fun handlePlaybackError(reason: String, force: Boolean = false): Boolean {
+        val player = exoPlayer ?: return true
+        if (!force) {
+            val state = player.playbackState
+            if (state == Player.STATE_READY || state == Player.STATE_BUFFERING) {
+                // 已经在正常播放/缓冲，报错的是已废弃的旧源，忽略
+                update { it.copy(isLoading = state == Player.STATE_BUFFERING, error = null) }
+                return true
+            }
         }
 
-        // 找到下一个未失败过的源
-        if (currentChannel.sources.size > 1 && currentState.retryCount < maxAutoRetries) {
-            var nextIndex = (currentState.currentSourceIndex + 1) % currentChannel.sources.size
+        val st = _playerState.value
+        val channel = st.currentChannel ?: return true
+
+        val now = System.currentTimeMillis()
+
+        // 跑够 8 秒才失败的源才记为"坏源"；几秒内就挂的可能是网络抖动，不标记
+        // 注意：当前源以顶层 currentSourceIndex 为准（currentChannel.currentSourceIndex 是惰性副本）
+        val currentUrl = channel.sources.getOrNull(st.currentSourceIndex)?.url
+        if (currentUrl != null && now - currentSourceStartedAt >= MIN_TRIAL_MS) {
+            sessionFailedSources.add(currentUrl)
+            sourceScores[currentUrl] = (sourceScores[currentUrl] ?: 0) - 3
+            Log.d(TAG, "标记失败源（跑了 ${now - currentSourceStartedAt}ms）: $currentUrl")
+        }
+
+        if (now - lastSwitchTime < SWITCH_DEBOUNCE_MS) return false
+
+        // 找下一个没失败过的源：健康度评分高的优先（本会话成功过的源先试），
+        // 同分时按轮转顺序，保证公平覆盖所有源
+        var candidate = -1
+        var bestScore = Int.MIN_VALUE
+        if (channel.sources.size > 1) {
+            var idx = (st.currentSourceIndex + 1) % channel.sources.size
             var attempts = 0
-            while (attempts < currentChannel.sources.size) {
-                val candidate = currentChannel.sources[nextIndex]
-                if (candidate.url !in sessionFailedSources) {
-                    break
+            while (attempts < channel.sources.size) {
+                if (channel.sources[idx].url !in sessionFailedSources) {
+                    val score = sourceScores[channel.sources[idx].url] ?: 0
+                    if (candidate == -1 || score > bestScore) {
+                        candidate = idx
+                        bestScore = score
+                    }
                 }
-                nextIndex = (nextIndex + 1) % currentChannel.sources.size
+                idx = (idx + 1) % channel.sources.size
                 attempts++
             }
-
-            // 所有源都失败过
-            if (attempts >= currentChannel.sources.size) {
-                _playerState.value = currentState.copy(
-                    isLoading = false,
-                    error = "所有源均失败，请尝试其他频道"
-                )
-                isSourceSwitching = false
-                return
-            }
-
-            isSourceSwitching = true
-            val nextSource = currentChannel.sources[nextIndex]
-
-            _playerState.value = currentState.copy(
-                retryCount = currentState.retryCount + 1,
-                currentSourceIndex = nextIndex,
-                isAutoSwitching = true,
-                switchReason = "源${nextIndex + 1}: ${nextSource.quality}"
-            )
-
-            if (nextIndex > 0) {
-                channelRepository.saveBestSourceIndex(currentChannel.id, nextIndex)
-            }
-
-            playSource(nextSource, currentChannel.copy(currentSourceIndex = nextIndex))
-        } else {
-            _playerState.value = currentState.copy(
-                isLoading = false,
-                error = "播放失败，请尝试其他频道"
-            )
-            isSourceSwitching = false
         }
+
+        if (candidate >= 0) {
+            lastSwitchTime = now
+            // 自动换源静默化：不弹"正在切换"提示（只用加载圈表达），
+            // 避免观看时频繁被打扰；跨频道跳转才提示
+            update {
+                it.copy(
+                    currentChannel = channel.withSourceIndex(candidate),
+                    currentSourceIndex = candidate,
+                    isLoading = true,
+                    error = null,
+                    isAutoSwitching = true,
+                    switchReason = null
+                )
+            }
+            if (candidate == st.currentSourceIndex) {
+                Log.d(TAG, "其余源均已标记失败，重试当前源${candidate + 1}（$reason）")
+            } else {
+                Log.d(TAG, "换源: ${channel.name} 源${st.currentSourceIndex + 1} → 源${candidate + 1}（$reason）")
+            }
+            playSource(channel.sources[candidate], channel.withSourceIndex(candidate))
+            return true
+        }
+
+        // 本频道所有源都被标记失败：
+        // - 播出过的（源只是暂时病了）：清标记，从最近成功源快速重试
+        // - 从未播出过（如晚高峰集体饿死）：并发测速全部源，直接跳到实测最快的，
+        //   避免逐个盲试造成长时间黑屏
+        fullCycles++
+        if (everReadyThisChannel && fullCycles < 2) {
+            sessionFailedSources.clear()
+            lastSwitchTime = now
+            val resumeIdx = if (lastReadySourceIndex in channel.sources.indices) lastReadySourceIndex else 0
+            Log.w(TAG, "「${channel.name}」全部源失败，第 $fullCycles 轮重新轮询（从源${resumeIdx + 1}开始）")
+            update {
+                it.copy(
+                    currentChannel = channel.withSourceIndex(resumeIdx),
+                    currentSourceIndex = resumeIdx,
+                    isLoading = true,
+                    error = null,
+                    isAutoSwitching = true
+                )
+            }
+            playSource(channel.sources[resumeIdx], channel.withSourceIndex(resumeIdx))
+            return true
+        }
+
+        // 并发测速（迷你竞速）：全部源同时探测，约 5 秒出结果
+        sessionFailedSources.clear()
+        Log.w(TAG, "「${channel.name}」从未播出/多轮失败，并发测速 ${channel.sources.size} 个源")
+        val ranked = channel.sources.map { src ->
+            viewModelScope.async(Dispatchers.IO) {
+                src to (measureSourceSpeedFast(src.url) ?: Long.MAX_VALUE)
+            }
+        }.awaitAll()
+            .filter { it.second != Long.MAX_VALUE }
+            .sortedByDescending { it.second }
+        if (ranked.isNotEmpty()) {
+            val best = ranked.first()
+            val idx = channel.sources.indexOf(best.first)
+            lastSwitchTime = now
+            Log.w(TAG, "测速完成，跳到最快源${idx + 1}（${best.second}ms）: ${best.first.url}")
+            update {
+                it.copy(
+                    currentChannel = channel.withSourceIndex(idx),
+                    currentSourceIndex = idx,
+                    isLoading = true,
+                    error = null,
+                    isAutoSwitching = true
+                )
+            }
+            playSource(best.first, channel.withSourceIndex(idx))
+            return true
+        }
+
+        // 测速也全部超时：自动跳到下一个有源的频道（老人场景下比报错停在黑屏更好）
+        if (autoAdvanceCount < MAX_AUTO_ADVANCE) {
+            val channels = playableChannels()
+            val currentIdx = channels.indexOfFirst { it.id == channel.id }
+            if (channels.size > 1 && currentIdx >= 0) {
+                val next = channels[(currentIdx + 1) % channels.size]
+                if (next.id != channel.id && next.sources.isNotEmpty()) {
+                    autoAdvanceCount++
+                    lastSwitchTime = now
+                    Log.w(TAG, "「${channel.name}」连续 $fullCycles 轮全部源失败，自动跳频道 → ${next.name}（第 $autoAdvanceCount 次）")
+                    update {
+                        it.copy(
+                            isAutoSwitching = true,
+                            switchReason = "源全部失败，切换到 ${next.name}",
+                            error = null
+                        )
+                    }
+                    playChannelInternal(next)
+                    return true
+                }
+            }
+        }
+
+        Log.e(TAG, "「${channel.name}」所有源均失败，60 秒后自动重新寻源")
+        update { it.copy(isLoading = false, isAutoSwitching = false, error = "所有源均失败，正在自动重试...") }
+        // 无人值守：不永久躺平。高峰期全站皆死时每 60 秒重置计数全量重新寻源，
+        // 任何一个源恢复，电视就自动亮起来
+        autoRetryJob?.cancel()
+        autoRetryJob = viewModelScope.launch {
+            delay(60_000)
+            if (_playerState.value.error == null) return@launch // 已恢复播放
+            Log.d(TAG, "自动重新寻源：重置全部失败标记，全量轮询")
+            autoAdvanceCount = 0
+            fullCycles = 0
+            sessionFailedSources.clear()
+            playChannelInternal(_playerState.value.currentChannel ?: channel)
+        }
+        return true
     }
 
     fun initializePlayer() {
-        if (exoPlayer == null) {
-            // 针对HLS直播优化的负载控制
-            val loadControl = DefaultLoadControl.Builder()
-                .setBufferDurationsMs(
-                    15000,    // minBufferMs: 15s，HLS 10s片段需完整缓冲
-                    60000,    // maxBufferMs: 60s
-                    5000,     // bufferForPlaybackMs: 缓冲5s后再播放，保证有画面
-                    10000     // bufferForPlaybackAfterRebufferMs
+        if (exoPlayer != null) return
+
+        // 针对低配电视的网络抖动调优：min=max 让缓冲始终保持在最满状态
+        // （Akamai 直播缓冲最佳实践），源要"真死"很久才会断流
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                40000,   // minBufferMs
+                40000,   // maxBufferMs（直播场景与 min 相等，保持常满）
+                4000,    // bufferForPlaybackMs: 缓冲 4s 起播
+                6000     // bufferForPlaybackAfterRebufferMs: 卡后攒 6s 再播
+            )
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
+
+        // 异步 MediaCodec 队列，降低低配电视解码压力；
+        // 解码器回退：硬解个别流失败时自动换解码器，避免"有流无画面"
+        val renderersFactory = DefaultRenderersFactory(context)
+            .forceEnableMediaCodecAsynchronousQueueing()
+            .setEnableDecoderFallback(true)
+
+        // OkHttp 数据源：连接池 keep-alive 复用 TCP 连接，分片间少握手；
+        // 跨协议重定向 + 5 秒超时快速失败
+        val okHttpClient = OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(5, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .connectionPool(ConnectionPool(8, 5, TimeUnit.MINUTES))
+            .build()
+        val dataSourceFactory = OkHttpDataSource.Factory(okHttpClient)
+            .setUserAgent("Mozilla/5.0")
+        val defaultDataSourceFactory = DefaultDataSource.Factory(context, dataSourceFactory)
+
+        // HLS 分片加载失败先在源内部重试 5 次（指数退避），
+        // 短暂网络抖动不升级为换源
+        val mediaSourceFactory = DefaultMediaSourceFactory(defaultDataSourceFactory)
+            .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(5))
+
+        exoPlayer = ExoPlayer.Builder(context, renderersFactory, mediaSourceFactory)
+            .setLoadControl(loadControl)
+            .build()
+            .also { player ->
+                player.addListener(playerListener)
+                player.playWhenReady = true
+                player.setHandleAudioBecomingNoisy(true)
+                player.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(C.USAGE_MEDIA)
+                        .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                        .build(),
+                    /* handleAudioFocus = */ true
                 )
-                .setPrioritizeTimeOverSizeThresholds(true)
-                .build()
-
-            // 异步MediaCodec队列，降低低配电视解码压力
-            val renderersFactory = DefaultRenderersFactory(context)
-                .forceEnableMediaCodecAsynchronousQueueing()
-
-            exoPlayer = ExoPlayer.Builder(context, renderersFactory)
-                .setLoadControl(loadControl)
-                .setUseLazyPreparation(false)
-                .build()
-                .also {
-                    it.addListener(playerListener)
-                    it.playWhenReady = true
-                    it.setHandleAudioBecomingNoisy(true)
-                    it.trackSelectionParameters = it.trackSelectionParameters
-                        .buildUpon()
-                        .setMaxVideoSize(1920, 1080)
-                        .build()
-                }
-        }
+                player.trackSelectionParameters = player.trackSelectionParameters
+                    .buildUpon()
+                    .setMaxVideoSize(1920, 1080)
+                    .build()
+            }
     }
 
     fun releasePlayer() {
@@ -207,77 +413,188 @@ class PlayerViewModel @Inject constructor(
         speedTestJob = null
         errorHandlingJob?.cancel()
         errorHandlingJob = null
+        autoRetryJob?.cancel()
+        autoRetryJob = null
         exoPlayer?.removeListener(playerListener)
         exoPlayer?.release()
         exoPlayer = null
         _playerState.value = PlayerState()
     }
 
+    /** 用户主动选台：重置自动跳频道预算后播放 */
     fun playChannel(channel: Channel) {
-        // 防抖：500ms内重复调用直接忽略
-        val now = System.currentTimeMillis()
-        if (now - lastChannelSwitchTime < 500) return
-        lastChannelSwitchTime = now
+        autoAdvanceCount = 0
+        playChannelInternal(channel)
+    }
 
-        isSourceSwitching = false
-        sessionFailedSources.clear()  // 换频道时清空失败记录
+    private fun playChannelInternal(channel: Channel) {
+        // 防抖：短时间内重复调用直接忽略
+        val now = System.currentTimeMillis()
+        if (now - lastChannelSwitchTime < CHANNEL_SWITCH_DEBOUNCE_MS) return
+        lastChannelSwitchTime = now
+        autoRetryJob?.cancel()
+
+        if (channel.sources.isEmpty()) {
+            update {
+                it.copy(
+                    currentChannel = channel,
+                    isLoading = false,
+                    isAutoSwitching = false,
+                    error = "「${channel.name}」暂无直播源，请先添加"
+                )
+            }
+            return
+        }
+
+        sessionFailedSources.clear()
+        everReadyThisChannel = false
+        fullCycles = 0
         // 使用缓存的最佳源索引
         val bestIdx = channelRepository.getBestSourceIndex(channel.id)
-        val sourceIndex = if (bestIdx in channel.sources.indices) bestIdx else 0
-        val channelWithSource = channel.copy(currentSourceIndex = sourceIndex)
-        _playerState.value = _playerState.value.copy(
-            currentChannel = channelWithSource,
-            currentSourceIndex = sourceIndex,
-            retryCount = 0,
-            isLoading = true,
-            error = null,
-            isAutoSwitching = false,
-            switchReason = null
-        )
-        // 保存最后观看频道
+        val idx = if (bestIdx in channel.sources.indices) bestIdx else 0
+        lastReadySourceIndex = idx
+        update {
+            it.copy(
+                currentChannel = channel.withSourceIndex(idx),
+                currentSourceIndex = idx,
+                isLoading = true,
+                error = null,
+                isAutoSwitching = false,
+                switchReason = null
+            )
+        }
         channelRepository.saveLastChannel(channel.id)
-        channelWithSource.currentSource?.let { playSource(it, channelWithSource) }
+        playSource(channel.sources[idx], channel.withSourceIndex(idx))
     }
 
     private fun playSource(source: StreamSource, channel: Channel) {
         exoPlayer?.let { player ->
-            // setMediaItem() 是 ExoPlayer 高层 API，内部正确处理解码器过渡，
-            // 不需要手动 stop()。setMediaSource() 是底层 API，跨流切换时不会
-            // 清理旧解码器，导致双重音频。
+            currentSourceStartedAt = System.currentTimeMillis()
+            currentSourceEverReady = false
+            // setMediaItem() 是高层 API，内部正确处理跨流解码器过渡，不会双重音频
             player.setMediaItem(buildMediaItem(source))
             player.prepare()
             player.playWhenReady = true
-            startPlaybackWatchdog(channel, source)
+            startPlaybackWatchdog()
         }
     }
 
-    // 智能保活 - 只在播放真正卡死时才干预
-    private fun startPlaybackWatchdog(@Suppress("UNUSED_PARAMETER") channel: Channel, @Suppress("UNUSED_PARAMETER") source: StreamSource) {
+    /**
+     * 播放看门狗：每 4 秒检查一次播放器真实状态，卡顿的最后一道防线。
+     * 全部使用 force 调用——看门狗就是因为状态不对才触发的，
+     * 不能被"正在播放/缓冲"保护挡掉。
+     * - READY 但进度约 8 秒不动（画面停住）→ 先原位重试当前源一次，仍卡则标记失败换源
+     * - BUFFERING 超 16 秒（源基本死了）→ 换源
+     * - ENDED（直播 playlist 结束）→ 先重试当前源，反复出现则换源
+     * - IDLE（异常中断）→ 换源
+     */
+    private fun startPlaybackWatchdog() {
         playbackCheckJob?.cancel()
         playbackCheckJob = viewModelScope.launch {
-            var consecutiveEndedCount = 0
-            while (true) {
-                delay(15000)
+            var lastPosition = -1L
+            var stalledChecks = 0
+            var stallRetries = 0
+            var bufferingChecks = 0
+            var bufferRetried = false
+            var endedRetried = false
+            var heartbeatTicks = 0
+            while (isActive) {
+                delay(WATCHDOG_INTERVAL_MS)
+                val player = exoPlayer ?: continue
 
-                exoPlayer?.let { player ->
-                    val state = player.playbackState
-                    when (state) {
-                        Player.STATE_IDLE -> {
-                            if (!isSourceSwitching) {
-                                handlePlaybackError()
-                            }
+                // 心跳日志：每分钟记录一次播放状态，便于事后排查
+                heartbeatTicks++
+                if (heartbeatTicks % 15 == 0) {
+                    val st = _playerState.value
+                    Log.d(
+                        TAG,
+                        "心跳: ${st.currentChannel?.name} 源${st.currentSourceIndex + 1}/${st.currentChannel?.sources?.size} " +
+                            "state=${player.playbackState} pos=${player.currentPosition / 1000}s"
+                    )
+                }
+                when (player.playbackState) {
+                    Player.STATE_READY -> {
+                        bufferingChecks = 0
+                        bufferRetried = false
+                        endedRetried = false
+                        val pos = player.currentPosition
+                        if (player.playWhenReady && abs(pos - lastPosition) < 500) {
+                            stalledChecks++
+                        } else {
+                            stalledChecks = 0
+                            stallRetries = 0
                         }
-                        Player.STATE_ENDED -> {
-                            consecutiveEndedCount++
-                            if (consecutiveEndedCount >= 4) {
-                                if (!isSourceSwitching) {
-                                    handlePlaybackError()
+                        lastPosition = pos
+                        if (stalledChecks >= STALL_CHECKS && player.playWhenReady) {
+                            stalledChecks = 0
+                            val st = _playerState.value
+                            val channel = st.currentChannel ?: continue
+                            val source = channel.sources.getOrNull(st.currentSourceIndex) ?: continue
+                            if (stallRetries < 1) {
+                                // 画面停住但没报错，多半是 playlist 断了：原位重试一次
+                                stallRetries++
+                                Log.w(TAG, "检测到画面停滞（${source.url}），原位重试")
+                                player.setMediaItem(buildMediaItem(source))
+                                player.prepare()
+                                player.playWhenReady = true
+                            } else {
+                                // 重试过了还卡，这个源确实不行
+                                stallRetries = 0
+                                sessionFailedSources.add(source.url)
+                                if (!handlePlaybackError("持续卡顿", force = true)) {
+                                    delay(SWITCH_DEBOUNCE_MS)
+                                    handlePlaybackError("持续卡顿复查", force = true)
                                 }
-                                return@launch
                             }
                         }
-                        Player.STATE_READY, Player.STATE_BUFFERING -> {
-                            consecutiveEndedCount = 0
+                    }
+                    Player.STATE_BUFFERING -> {
+                        bufferingChecks++
+                        if (bufferingChecks >= BUFFERING_CHECKS_LIMIT) {
+                            bufferingChecks = 0
+                            val st = _playerState.value
+                            val source = st.currentChannel?.sources?.getOrNull(st.currentSourceIndex)
+                            if (!bufferRetried && currentSourceEverReady && source != null) {
+                                // 播出过才中断的：先原位重载 playlist，比换源恢复更快；
+                                // 从没播出过的死源，重载同一个 URL 纯属浪费黑屏时间
+                                bufferRetried = true
+                                Log.w(TAG, "缓冲超时，原位重载重试")
+                                player.setMediaItem(buildMediaItem(source))
+                                player.prepare()
+                                player.playWhenReady = true
+                            } else {
+                                bufferRetried = false
+                                Log.w(TAG, "缓冲超时，换源")
+                                if (!handlePlaybackError("缓冲超时", force = true)) {
+                                    delay(SWITCH_DEBOUNCE_MS)
+                                    handlePlaybackError("缓冲超时复查", force = true)
+                                }
+                            }
+                        }
+                    }
+                    Player.STATE_ENDED -> {
+                        if (!endedRetried) {
+                            endedRetried = true
+                            Log.w(TAG, "直播流结束，原位重试")
+                            val st = _playerState.value
+                            val source = st.currentChannel?.sources?.getOrNull(st.currentSourceIndex)
+                            if (source != null) {
+                                player.setMediaItem(buildMediaItem(source))
+                                player.prepare()
+                                player.playWhenReady = true
+                            }
+                        } else {
+                            endedRetried = false
+                            if (!handlePlaybackError("直播流结束", force = true)) {
+                                delay(SWITCH_DEBOUNCE_MS)
+                                handlePlaybackError("直播流结束复查", force = true)
+                            }
+                        }
+                    }
+                    Player.STATE_IDLE -> {
+                        if (!handlePlaybackError("播放中断", force = true)) {
+                            delay(SWITCH_DEBOUNCE_MS)
+                            handlePlaybackError("播放中断复查", force = true)
                         }
                     }
                 }
@@ -288,13 +605,16 @@ class PlayerViewModel @Inject constructor(
     private fun buildMediaItem(source: StreamSource): MediaItem {
         return MediaItem.Builder()
             .setUri(Uri.parse(source.url))
+            // 直播边缘"深蹲"策略（官方文档 + androidx#1852 实践）：
+            // 播放位置蹲在直播边缘后 15 秒，瞬时抖动 15 秒内根本饿不着；
+            // 倍速锁 1.0-1.1：不追边（追边是卡顿元凶），只允许缓慢回追保持深度
             .setLiveConfiguration(
                 MediaItem.LiveConfiguration.Builder()
-                    .setTargetOffsetMs(3000)
-                    .setMinOffsetMs(1000)
-                    .setMaxOffsetMs(8000)
-                    .setMinPlaybackSpeed(0.97f)
-                    .setMaxPlaybackSpeed(1.03f)
+                    .setTargetOffsetMs(15000)
+                    .setMinOffsetMs(8000)
+                    .setMaxOffsetMs(25000)
+                    .setMinPlaybackSpeed(1.0f)
+                    .setMaxPlaybackSpeed(1.1f)
                     .build()
             )
             .build()
@@ -303,283 +623,220 @@ class PlayerViewModel @Inject constructor(
     fun getPlayer(): ExoPlayer? = exoPlayer
 
     fun switchToNextChannel() {
-        val channels = channelRepository.getChannels()
-        val currentChannel = _playerState.value.currentChannel
-        val currentIndex = channels.indexOfFirst { it.id == currentChannel?.id }
-        if (currentIndex >= 0 && currentIndex < channels.size - 1) {
-            playChannel(channels[currentIndex + 1])
-        } else if (channels.isNotEmpty()) {
-            playChannel(channels[0])
-        }
+        val channels = playableChannels()
+        if (channels.isEmpty()) return
+        val current = _playerState.value.currentChannel
+        val index = channels.indexOfFirst { it.id == current?.id }
+        playChannel(if (index in 0 until channels.size - 1) channels[index + 1] else channels[0])
     }
 
     fun switchToPreviousChannel() {
-        val channels = channelRepository.getChannels()
-        val currentChannel = _playerState.value.currentChannel
-        val currentIndex = channels.indexOfFirst { it.id == currentChannel?.id }
-        if (currentIndex > 0) {
-            playChannel(channels[currentIndex - 1])
-        } else if (channels.isNotEmpty()) {
-            playChannel(channels[channels.size - 1])
-        }
+        val channels = playableChannels()
+        if (channels.isEmpty()) return
+        val current = _playerState.value.currentChannel
+        val index = channels.indexOfFirst { it.id == current?.id }
+        playChannel(if (index > 0) channels[index - 1] else channels[channels.size - 1])
     }
 
     fun retry() {
-        isSourceSwitching = false
-        val channel = _playerState.value.currentChannel ?: return
-        _playerState.value = _playerState.value.copy(retryCount = 0)
-        channel.currentSource?.let { playSource(it, channel) }
+        val st = _playerState.value
+        val channel = st.currentChannel ?: return
+        val source = channel.currentSource ?: return
+        sessionFailedSources.remove(source.url)
+        update { it.copy(isLoading = true, error = null, isAutoSwitching = false, switchReason = null) }
+        playSource(source, channel)
     }
 
+    /** 手动切换到下一个源（不标记失败） */
     fun switchToNextSource() {
-        val currentState = _playerState.value
-        val channel = currentState.currentChannel ?: return
+        val st = _playerState.value
+        val channel = st.currentChannel ?: return
         if (channel.sources.size <= 1) return
 
-        isSourceSwitching = true
-        val nextIndex = (currentState.currentSourceIndex + 1) % channel.sources.size
-        val nextSource = channel.sources[nextIndex]
-
-        _playerState.value = currentState.copy(
-            currentSourceIndex = nextIndex,
-            retryCount = 0,
-            isAutoSwitching = false,
-            switchReason = "切换: ${nextSource.quality}"
-        )
-
-        playSource(nextSource, channel.copy(currentSourceIndex = nextIndex))
-    }
-
-    fun cycleDecoderType() {
-        val current = _playerState.value.decoderType
-        val next = when (current) {
-            DecoderType.AUTO -> DecoderType.HARDWARE
-            DecoderType.HARDWARE -> DecoderType.SOFTWARE
-            DecoderType.SOFTWARE -> DecoderType.AUTO
+        val nextIndex = (st.currentSourceIndex + 1) % channel.sources.size
+        update {
+            it.copy(
+                currentChannel = channel.withSourceIndex(nextIndex),
+                currentSourceIndex = nextIndex,
+                isAutoSwitching = false,
+                switchReason = null,
+                isLoading = true,
+                error = null
+            )
         }
-        _playerState.value = _playerState.value.copy(decoderType = next)
+        playSource(channel.sources[nextIndex], channel.withSourceIndex(nextIndex))
     }
 
     fun playDefaultChannel() {
-        val defaultChannel = channelRepository.getDefaultChannel()
-        playChannel(defaultChannel)
+        playChannel(channelRepository.getDefaultChannel())
     }
 
-    // 快速启动：有缓存最佳源就直接播放，不跑测速
+    fun getDefaultChannel(): Channel = channelRepository.getDefaultChannel()
+
+    /** 快速启动：有缓存的最佳源就直接播放，否则测速选源 */
     fun quickStartOrTest() {
         val defaultChannel = channelRepository.getDefaultChannel()
         val bestIdx = channelRepository.getBestSourceIndex(defaultChannel.id)
         if (bestIdx in defaultChannel.sources.indices) {
-            // 有缓存，直接播放
-            val channelWithSource = defaultChannel.copy(currentSourceIndex = bestIdx)
-            playChannel(channelWithSource)
-            // 后台检查是否需要更新远程源（3天一更新）
-            viewModelScope.launch(Dispatchers.IO) {
-                if (shouldUpdateSources()) {
-                    val result = fetchRemoteSources()
-                    if (result.isSuccess) {
-                        channelRepository.updateRemoteSources(result.getOrNull()!!)
-                    }
-                }
-            }
+            playChannel(defaultChannel.withSourceIndex(bestIdx))
+            viewModelScope.launch(Dispatchers.IO) { refreshRemoteSourcesIfNeeded() }
         } else {
-            // 没有缓存，跑测速（测速内部也会更新远程源）
-            speedTestAllSources { _ -> }
+            speedTestAndPlay()
         }
     }
 
-    // 检查是否需要更新远程源（距上次更新超过3天）
-    private fun shouldUpdateSources(): Boolean {
-        val lastUpdate = channelRepository.getLastUpdateTime()
-        val threeDaysMs = 3L * 24 * 60 * 60 * 1000
-        return System.currentTimeMillis() - lastUpdate > threeDaysMs
-    }
+    // ============================================================
+    // 测速
+    // ============================================================
 
-    // 获取所有频道
-    fun getChannels(): List<Channel> = channelRepository.getChannels()
-
-    // 获取所有分类
-    fun getAllCategories(): List<ChannelCategory> = channelRepository.getAllCategories()
-
-    // 根据分类获取频道
-    fun getChannelsByCategory(category: ChannelCategory): List<Channel> =
-        channelRepository.getChannelsByCategory(category)
-
-    fun clearError() {
-        _playerState.value = _playerState.value.copy(error = null)
-    }
-
-    // 测速所有源 - 先测CCTV-8播放，后台继续测CCTV-1和CCTV-6
-    fun speedTestAllSources(onComplete: (SpeedTestResult) -> Unit) {
+    /**
+     * 测速默认频道的所有源并播放最快的。逐个测、逐个刷新 UI，
+     * 单源频道不弹测速窗直接播。
+     */
+    private fun speedTestAndPlay() {
         speedTestJob?.cancel()
         speedTestJob = viewModelScope.launch {
-            _playerState.value = _playerState.value.copy(
-                isSpeedTesting = true,
-                speedTestProgress = 0f,
-                speedTestItems = emptyList(),
-                currentTesting = null,
-                bestChannel = null,
-                bestSpeed = null,
-                isBackgroundTesting = false
-            )
+            val defaultChannel = channelRepository.getDefaultChannel()
+            val sources = defaultChannel.sources
 
-            // 后台拉取最新远程源（非阻塞）
-            async(Dispatchers.IO) {
-                if (shouldUpdateSources()) {
-                    val remoteResult = fetchRemoteSources()
-                    if (remoteResult.isSuccess) {
-                        channelRepository.updateRemoteSources(remoteResult.getOrNull()!!)
-                    }
+            if (sources.isEmpty()) {
+                update {
+                    it.copy(isSpeedTesting = false, error = "暂无可播放的频道，请先添加直播源")
                 }
+                return@launch
             }
 
-            val channels = channelRepository.getChannels()
-
-            // 第一步：只测CCTV-8的源（静默测速，不更新UI）
-            val cctv8Sources = mutableListOf<Pair<Channel, StreamSource>>()
-            for (channel in channels) {
-                if (channel.name.contains("CCTV-8") || channel.name == "CCTV-8") {
-                    for (source in channel.sources) {
-                        cctv8Sources.add(Pair(channel, source))
-                    }
-                }
-            }
-
-            // 静默测CCTV-8 - 所有源测完再播放
-            var bestCctv8: Pair<Channel, StreamSource>? = null
-            var bestCctv8Speed: Long = Long.MAX_VALUE
-            val testItems = mutableListOf<SpeedTestItem>()
-
-            for ((_, pair) in cctv8Sources.withIndex()) {
-                val (channel, source) = pair
-                val speedMs = measureSourceSpeedFast(source.url)
-
-                val status = if (speedMs != null && speedMs <= 3000) {
-                    if (speedMs < bestCctv8Speed) {
-                        bestCctv8Speed = speedMs
-                        bestCctv8 = pair
-                    }
-                    TestStatus.SUCCESS
-                } else {
-                    TestStatus.FAILED
-                }
-
-                testItems.add(SpeedTestItem(
-                    channelName = channel.name,
-                    sourceUrl = source.url,
-                    quality = source.quality,
-                    status = status,
-                    speedMs = speedMs,
-                    message = if (speedMs == null) "超时" else if (speedMs > 200) "${speedMs}ms太慢" else ""
-                ))
-
-                delay(50) // 测完一个稍作延迟
-            }
-
-            // 测完后更新一次UI，然后立即播放
-            _playerState.value = _playerState.value.copy(
-                speedTestItems = testItems.toList(),
-                bestChannel = bestCctv8?.first?.name,
-                bestSpeed = if (bestCctv8Speed < Long.MAX_VALUE) bestCctv8Speed else null
-            )
-
-            // 找到CCTV-8的最快源，立即播放并缓存
-            if (bestCctv8 != null) {
-                val channel = bestCctv8.first
-                val sourceIdx = channel.sources.indexOf(bestCctv8.second)
-                channelRepository.saveBestSourceIndex(channel.id, sourceIdx)
-                _playerState.value = _playerState.value.copy(isSpeedTesting = false)
-                // 通过playChannel()播放，走完整的状态管理流程
-                playChannel(channel)
-            } else {
-                _playerState.value = _playerState.value.copy(isSpeedTesting = false)
-            }
-
-            // 第二步：后台继续测CCTV-1和CCTV-6并保存最佳源
-            async(Dispatchers.IO) {
-                val backgroundChannels = listOf("CCTV-1", "CCTV-6")
-
-                for (priorityName in backgroundChannels) {
-                    for (channel in channels) {
-                        if (channel.name.contains(priorityName)) {
-                            var bestIdx = -1
-                            var bestSpeed = Long.MAX_VALUE
-                            for ((idx, source) in channel.sources.withIndex()) {
-                                val speedMs = measureSourceSpeedFast(source.url)
-                                if (speedMs != null && speedMs < bestSpeed && speedMs <= 3000) {
-                                    bestSpeed = speedMs
-                                    bestIdx = idx
-                                }
-                                delay(500)
-                            }
-                            if (bestIdx >= 0) {
-                                channelRepository.saveBestSourceIndex(channel.id, bestIdx)
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 返回结果
-            if (bestCctv8 != null) {
-                val result = SpeedTestResult(
-                    channelName = bestCctv8.first.name,
-                    sourceUrl = bestCctv8.second.url,
-                    quality = bestCctv8.second.quality,
-                    speedMs = bestCctv8Speed,
-                    isSuccess = true
+            val showUi = sources.size > 1
+            update { st ->
+                st.copy(
+                    isSpeedTesting = showUi,
+                    speedTestProgress = 0f,
+                    speedTestItems = sources.map { source ->
+                        SpeedTestItem(
+                            channelName = defaultChannel.name,
+                            sourceUrl = source.url,
+                            quality = source.quality
+                        )
+                    },
+                    currentTesting = null,
+                    bestChannel = null,
+                    bestSpeed = null
                 )
-                onComplete(result)
             }
+
+            val remoteJob = launch(Dispatchers.IO) { refreshRemoteSourcesIfNeeded() }
+
+            val items = sources.map { source ->
+                SpeedTestItem(defaultChannel.name, source.url, source.quality)
+            }.toMutableList()
+            var bestIdx = 0
+            var bestSpeed = Long.MAX_VALUE
+
+            for ((i, source) in sources.withIndex()) {
+                if (showUi) {
+                    update {
+                        it.copy(
+                            currentTesting = "源${i + 1} · ${source.quality}",
+                            speedTestItems = it.speedTestItems.mapIndexed { j, item ->
+                                if (j == i) item.copy(status = TestStatus.TESTING) else item
+                            }
+                        )
+                    }
+                }
+                val speedMs = measureSourceSpeedFast(source.url)
+                val ok = speedMs != null && speedMs <= SPEED_TEST_TIMEOUT_MS
+                if (ok && speedMs != null && speedMs < bestSpeed) {
+                    bestSpeed = speedMs
+                    bestIdx = i
+                }
+                items[i] = items[i].copy(
+                    status = if (ok) TestStatus.SUCCESS else TestStatus.FAILED,
+                    speedMs = speedMs,
+                    message = when {
+                        speedMs == null -> "超时"
+                        !ok -> "太慢(${speedMs}ms)"
+                        else -> ""
+                    }
+                )
+                if (showUi) {
+                    update {
+                        it.copy(
+                            speedTestItems = items.toList(),
+                            speedTestProgress = (i + 1) / sources.size.toFloat()
+                        )
+                    }
+                }
+                delay(100)
+            }
+
+            val hasResult = bestSpeed < Long.MAX_VALUE
+            if (showUi) {
+                update {
+                    it.copy(
+                        isSpeedTesting = false,
+                        bestChannel = if (hasResult) defaultChannel.name else null,
+                        bestSpeed = if (hasResult) bestSpeed else null
+                    )
+                }
+            }
+            channelRepository.saveBestSourceIndex(defaultChannel.id, bestIdx)
+            playChannel(defaultChannel.withSourceIndex(bestIdx))
         }
     }
 
-    // 快速测速 - 实际下载m3u8内容并验证TS片段可达
+    /** 跳过测速，直接用缓存/第一个源播放 */
+    fun skipSpeedTest() {
+        speedTestJob?.cancel()
+        speedTestJob = null
+        update { it.copy(isSpeedTesting = false) }
+        playDefaultChannel()
+    }
+
+    /**
+     * 快速测速：真实下载 m3u8 并验证首个分片可达，返回总耗时（毫秒），失败返回 null
+     */
     private suspend fun measureSourceSpeedFast(url: String): Long? = withContext(Dispatchers.IO) {
         try {
             val startTime = System.currentTimeMillis()
-            val urlObj = URL(url)
-            val conn = urlObj.openConnection() as HttpURLConnection
+            val conn = URL(url).openConnection() as HttpURLConnection
             conn.connectTimeout = 3000
             conn.readTimeout = 5000
             conn.requestMethod = "GET"
             conn.instanceFollowRedirects = true
             conn.setRequestProperty("User-Agent", "Mozilla/5.0")
 
-            val responseCode = conn.responseCode
-            if (responseCode != HttpURLConnection.HTTP_OK) {
+            if (conn.responseCode != HttpURLConnection.HTTP_OK) {
                 conn.disconnect()
                 return@withContext null
             }
 
-            // 读取m3u8内容，获取第一个TS片段地址
-            val reader = BufferedReader(InputStreamReader(conn.inputStream))
+            // 读取 m3u8 内容，找到第一个分片地址
             var tsPath: String? = null
-            var lineCount = 0
-            while (lineCount < 50) {
-                val line = reader.readLine() ?: break
-                if (!line.startsWith("#") && (line.contains(".ts") || line.contains(".m3u8"))) {
-                    tsPath = line.trim()
-                    break
+            conn.inputStream.bufferedReader().use { reader ->
+                var lineCount = 0
+                while (lineCount < 50) {
+                    val line = reader.readLine() ?: break
+                    if (!line.startsWith("#") && (line.contains(".ts") || line.contains(".m3u8"))) {
+                        tsPath = line.trim()
+                        break
+                    }
+                    lineCount++
                 }
-                lineCount++
             }
-            reader.close()
             conn.disconnect()
 
-            // 验证第一个TS片段可达
+            // 验证首个分片可达
             if (tsPath != null) {
                 val baseUrl = url.substringBeforeLast("/")
-                val tsUrl = if (tsPath.startsWith("http")) tsPath else "$baseUrl/$tsPath"
+                val tsUrl = if (tsPath!!.startsWith("http")) tsPath else "$baseUrl/$tsPath"
                 val tsConn = URL(tsUrl).openConnection() as HttpURLConnection
                 tsConn.connectTimeout = 3000
                 tsConn.readTimeout = 3000
                 tsConn.requestMethod = "HEAD"
                 tsConn.instanceFollowRedirects = true
-                val tsCode = tsConn.responseCode
+                val code = tsConn.responseCode
                 tsConn.disconnect()
-
-                if (tsCode == HttpURLConnection.HTTP_OK || tsCode == 206) {
+                if (code == HttpURLConnection.HTTP_OK || code == 206) {
                     return@withContext System.currentTimeMillis() - startTime
                 }
             }
@@ -589,46 +846,61 @@ class PlayerViewModel @Inject constructor(
         }
     }
 
-    // 获取远程源 — 用户可在 ChannelRepository 中配置远程源 URL
-    // 远程源格式: 频道名,URL (每行一个，支持 #genre# 分类标记)
+    // ============================================================
+    // 远程源更新
+    // ============================================================
+
+    private fun shouldUpdateSources(): Boolean {
+        val lastUpdate = channelRepository.getLastUpdateTime()
+        val threeDaysMs = 3L * 24 * 60 * 60 * 1000
+        return System.currentTimeMillis() - lastUpdate > threeDaysMs
+    }
+
+    private suspend fun refreshRemoteSourcesIfNeeded() {
+        if (REMOTE_SOURCE_URL.isBlank()) return
+        if (!shouldUpdateSources()) return
+        fetchRemoteSources().onSuccess { channelRepository.updateRemoteSources(it) }
+    }
+
+    /** 拉取远程 IPTV 源列表（仅支持 http/https） */
     private suspend fun fetchRemoteSources(): Result<List<String>> = withContext(Dispatchers.IO) {
-        // 如果你有远程 IPTV 源地址，在这里填入 URL:
-        // val url = URL("https://你的远程源地址/iptv.txt")
-        // 然后取消下面注释:
-        /*
-        try {
-            val url = URL("https://example.com/iptv.txt")  // 替换为你的远程源地址
+        runCatching {
+            val url = URL(REMOTE_SOURCE_URL)
+            require(url.protocol == "http" || url.protocol == "https") { "仅支持 http/https" }
             val conn = url.openConnection() as HttpURLConnection
             conn.connectTimeout = 10000
             conn.readTimeout = 10000
             conn.requestMethod = "GET"
             conn.setRequestProperty("User-Agent", "Mozilla/5.0")
-
             if (conn.responseCode != HttpURLConnection.HTTP_OK) {
-                return@withContext Result.failure(Exception("HTTP ${conn.responseCode}"))
+                error("HTTP ${conn.responseCode}")
             }
-
-            val reader = BufferedReader(InputStreamReader(conn.inputStream, "UTF-8"))
-            val lines = reader.readLines()
-            reader.close()
+            val lines = BufferedReader(InputStreamReader(conn.inputStream, "UTF-8")).use { it.readLines() }
             conn.disconnect()
-
-            Result.success(lines)
-        } catch (e: Exception) {
-            Result.failure(e)
+            lines
         }
-        */
-        // 默认不启用远程源，使用内置源即可
-        Result.failure(Exception("未配置远程源"))
     }
 
-    fun cancelSpeedTest() {
-        speedTestJob?.cancel()
-        speedTestJob = null
-        _playerState.value = _playerState.value.copy(
-            isSpeedTesting = false,
-            speedTestLogs = _playerState.value.speedTestLogs + "测速已取消"
-        )
+    // ============================================================
+    // 数据透传
+    // ============================================================
+
+    fun getChannels(): List<Channel> = channelRepository.getChannels()
+
+    fun getAllCategories(): List<ChannelCategory> = channelRepository.getAllCategories()
+
+    fun getChannelsByCategory(category: ChannelCategory): List<Channel> =
+        channelRepository.getChannelsByCategory(category).filter { it.sources.isNotEmpty() }
+
+    /** 有源可播的频道（播放器内部换台用） */
+    private fun playableChannels(): List<Channel> = getChannels().filter { it.sources.isNotEmpty() }
+
+    fun clearError() {
+        update { it.copy(error = null) }
+    }
+
+    private fun update(transform: (PlayerState) -> PlayerState) {
+        _playerState.value = transform(_playerState.value)
     }
 
     override fun onCleared() {

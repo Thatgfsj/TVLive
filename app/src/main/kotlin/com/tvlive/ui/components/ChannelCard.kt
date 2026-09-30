@@ -10,6 +10,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -20,13 +21,14 @@ import com.tvlive.data.model.Channel
 fun ChannelCard(
     channel: Channel,
     isSelected: Boolean,
+    isPlaying: Boolean = false,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val borderColor = if (isSelected) {
-        MaterialTheme.colorScheme.primary
-    } else {
-        Color.Transparent
+    val borderColor = when {
+        isSelected -> MaterialTheme.colorScheme.primary
+        isPlaying -> Color(0xFF4CAF50)
+        else -> Color.Gray.copy(alpha = 0.3f)
     }
 
     val backgroundColor = if (isSelected) {
@@ -42,7 +44,7 @@ fun ChannelCard(
             .background(backgroundColor, shape = MaterialTheme.shapes.medium)
             .border(
                 width = if (isSelected) 3.dp else 1.dp,
-                color = if (isSelected) MaterialTheme.colorScheme.primary else Color.Gray.copy(alpha = 0.3f),
+                color = borderColor,
                 shape = MaterialTheme.shapes.medium
             )
             .clickable(onClick = onClick),
@@ -59,14 +61,45 @@ fun ChannelCard(
                     fontSize = 18.sp,
                     lineHeight = 24.sp
                 ),
-                color = if (isSelected) {
-                    MaterialTheme.colorScheme.primary
-                } else {
-                    MaterialTheme.colorScheme.onSurface
+                color = when {
+                    isSelected -> MaterialTheme.colorScheme.primary
+                    isPlaying -> Color(0xFF4CAF50)
+                    else -> MaterialTheme.colorScheme.onSurface
                 },
                 textAlign = TextAlign.Center,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        if (isPlaying) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(6.dp)
+                    .background(
+                        Color(0xFF4CAF50),
+                        shape = MaterialTheme.shapes.small
+                    )
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            ) {
+                Text(
+                    text = "播放中",
+                    fontSize = 10.sp,
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        if (channel.sources.size > 1) {
+            Text(
+                text = "${channel.sources.size}源",
+                fontSize = 10.sp,
+                color = Color.White.copy(alpha = 0.5f),
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(6.dp)
             )
         }
     }

@@ -4,15 +4,11 @@ data class Channel(
     val id: String,
     val name: String,
     val category: ChannelCategory,
-    val logo: String? = null,
     val sources: List<StreamSource> = emptyList(),
     val currentSourceIndex: Int = 0
 ) {
     val currentSource: StreamSource?
         get() = sources.getOrNull(currentSourceIndex)
-
-    val nextSource: StreamSource?
-        get() = sources.getOrNull((currentSourceIndex + 1) % sources.size)
 
     fun nextSourceIndex(): Int = (currentSourceIndex + 1) % sources.size.coerceAtLeast(1)
 
@@ -21,9 +17,7 @@ data class Channel(
 
 data class StreamSource(
     val url: String,
-    val quality: String = "原画",
-    val referer: String? = null,
-    val userAgent: String? = null
+    val quality: String = "自动"
 )
 
 enum class ChannelCategory(val displayName: String, val order: Int) {
@@ -40,10 +34,4 @@ enum class ChannelCategory(val displayName: String, val order: Int) {
     GALA("春晚", 10),       // 春晚频道
     LIVE_CHINA("直播中国", 11), // 直播中国
     OTHER("其他", 99)
-}
-
-enum class DecoderType(val displayName: String) {
-    HARDWARE("硬解"),
-    SOFTWARE("软解"),
-    AUTO("自动")
 }

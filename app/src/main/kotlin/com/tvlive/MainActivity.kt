@@ -3,7 +3,6 @@ package com.tvlive
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.WindowManager
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -22,7 +21,9 @@ import com.tvlive.ui.theme.TVLiveTheme
 import dagger.hilt.android.AndroidEntryPoint
 
 @AndroidEntryPoint
-class MainActivity : ComponentActivity() {
+class MainActivity : ComponentActivity(), KeyDispatchOwner {
+
+    override val keyHub = KeyEventHub()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -52,16 +53,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // 拦截所有按键，让应用完全控制
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        Log.d("MainActivity", "onKeyDown: keyCode=$keyCode, action=${event?.action}")
-        // 拦截所有按键，不传递给系统
-        return true
-    }
-
+    // 遥控器按键在焦点系统之前接管，处理不了的放行给系统
     override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
-        Log.d("MainActivity", "dispatchKeyEvent: keyCode=${event?.keyCode}, action=${event?.action}")
-        // 拦截所有按键事件
+        if (event != null && keyHub.dispatch(event)) return true
         return super.dispatchKeyEvent(event)
     }
 }
