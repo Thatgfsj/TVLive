@@ -15,3 +15,6 @@ local.properties
 *.aab
 *.jks
 *.keystore
+
+# Mimosa 安全扫描缓存
+.mimosa/

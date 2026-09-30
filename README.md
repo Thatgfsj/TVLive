@@ -22,9 +22,17 @@
 
 ## 如何添加直播源
 
-> **本项目不包含任何直播源 URL，以规避版权风险。请自行添加。**
+> **为规避版权风险，本项目不包含任何直播源 URL，也不内置任何公共列表地址。播放器框架开箱即用，源请自行准备。**
 
-### 方法一：直接编辑内置源（推荐）
+### 方法一：配置远程自动更新（推荐）
+
+在 `PlayerViewModel.kt` 的 `REMOTE_SOURCE_URL` 填入你信任的 IPTV 列表地址（支持 m3u / txt 格式），App 每 3 天自动拉取，新源与内置频道按名称合并、主机去重。
+
+### 方法二：本地源文件（无需改代码）
+
+把 IPTV 列表放到 `/sdcard/Android/data/com.tvlive/files/sources.txt`（支持 `频道名,URL` txt 和 m3u 两种格式），重启 App 即生效，优先级最高。
+
+### 方法三：直接编辑内置源
 
 打开 `app/src/main/kotlin/com/tvlive/data/repository/ChannelRepository.kt`，在对应频道的 `sources` 列表中添加：
 
@@ -35,13 +43,9 @@ Channel(id = "cctv8", name = "CCTV-8 电视剧", category = ChannelCategory.CCTV
 )),
 ```
 
-### 方法二：配置远程源自动更新
+## 版权声明
 
-在 `PlayerViewModel.kt` 的 `fetchRemoteSources()` 方法中填入你的远程源地址，支持以下格式：
-
-```
-频道名,URL
-```
+本项目只是一个开源播放器框架，**不提供、不内置、不链接任何受版权保护的直播内容或源列表**。用户需自行准备合法的观看途径，因使用本项目产生的任何版权问题与项目作者无关。
 
 ## 编译
 
